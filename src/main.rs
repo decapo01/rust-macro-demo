@@ -16,7 +16,7 @@ use field_names::FieldNames;
 use proc_macro::TokenStream;
 use rust_decimal_macros::dec;
 use std::error::Error;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{FromSql, ToSql};
 use tokio_postgres::{Client, Config, GenericClient, NoTls, Row};
 use uuid::Uuid;
 
@@ -24,125 +24,6 @@ trait Criteria {}
 
 #[derive(Debug)]
 pub struct ThingId(String);
-
-macro_rules! enum_str {
-    (enum $name:ident {
-        $($variant:ident = $val:expr),*,
-    }) => {
-        enum $name {
-            $($variant = $val),*
-        }
-
-        impl $name {
-            fn name(&self) -> &'static str {
-                match self {
-                    $($name::$variant => stringify!($variant)),*
-                }
-            }
-        }
-    };
-}
-
-macro_rules! entity {
-    (pub struct $name:ident {
-        $(pub $fname:ident : $field_type:ty,)*
-    }) => {
-        #[derive(Debug)]
-        struct $name {
-            $($fname : $field_type),*
-        }
-
-        paste! {
-            #[derive(Debug)]
-            enum [<$name Fields>] {
-                $([<$fname:camel>]),*
-            }
-
-            impl fmt::Display for [<$name Fields>] {
-                fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                    fmt::Debug::fmt(self, f)
-                }
-            }
-        }
-
-        paste! {
-            enum [<$name Criteria>] {
-                $([<$fname:camel Eq>]($field_type)),*,
-                $([<$fname:camel Neq >]($field_type)),*,
-                $([<$fname:camel Gt>]($field_type)),*,
-                $([<$fname:camel Gte>]($field_type)),*,
-                $([<$fname:camel Lt>]($field_type)),*,
-                $([<$fname:camel Lte>]($field_type)),*,
-                $([<$fname:camel In>](Vec<$field_type>)),*,
-                $([<$fname:camel Nin>](Vec<$field_type>)),*,
-            }
-
-            #[derive(Default,Debug)]
-            struct [<$name CriteriaStruct>] {
-                $([<$fname _eq>]: Option<$field_type>),*,
-                $([<$fname _neq >]: Option<$field_type>),*,
-                $([<$fname _gt>]: Option<$field_type>),*,
-                $([<$fname _gte>]: Option<$field_type>),*,
-                $([<$fname _lt>]: Option<$field_type>),*,
-                $([<$fname _lte>]: Option<$field_type>),*,
-                $([<$fname _in>]: Vec<$field_type>),*,
-                $([<$fname _nin>]: Vec<$field_type>),*,
-                search_term: Option<String>,
-            }
-        }
-
-
-        impl $name {
-
-            fn field_names() -> &'static [&'static str] {
-                static NAMES: &'static [&'static str] = &[$(stringify!($fname)),*];
-                NAMES
-            }
-
-            fn field_types() -> &'static [&'static str] {
-                static TYPES: &'static [&'static str] = &[$(stringify!($field_type)),*];
-                TYPES
-            }
-
-            fn to_params_x<'a>(&'a self) -> Vec<&'a (dyn ToSql + Sync)> {
-                vec![
-                    $(&self.$fname as &(dyn ToSql + Sync)),*
-                ][1..].into_iter().map(|x| *x as &(dyn ToSql + Sync)).collect::<Vec<&'a (dyn ToSql + Sync)>>()
-            }
-        }
-    }
-}
-
-/*
-entity! {
-pub struct Thing {
-    pub id: ThingId,
-    pub thing_name: String,
-    pub amount: f32,
-}
-}
-*/
-
-entity! {
-    pub struct User {
-        pub id: Uuid,
-        pub name: String,
-        pub money: Decimal,
-        pub velocity: Decimal,
-        pub start_time: DateTime<Local>,
-        pub misc: String,
-    }
-}
-
-fn check_crit() {
-    let x = UserCriteria::NameEq("blajlkjd".to_string());
-}
-
-#[derive(FieldNames)]
-pub struct Item {
-    pub id: String,
-    pub name: String,
-}
 
 fn create_insert_sql(table: &String, id_field: &String, fields: &[String]) -> String {
     let fields_sql: String = fields
@@ -202,6 +83,300 @@ async fn update(
     Ok(())
 }
 
+type Field = String;
+type Value = (dyn ToSql + Sync);
+
+enum QueryCondition<'a> {
+    Eq(Field, &'a Value),
+    Neq(Field, &'a Value),
+    Gt(Field, &'a Value),
+    Gte(Field, &'a Value),
+    Lt(Field, &'a Value),
+    Lte(Field, &'a Value),
+    In(Field, &'a Value),
+    Nin(Field, &'a Value),
+}
+
+fn query_cond_to_string(q_cond: &QueryCondition, n: i32) -> String {
+    match q_cond {
+        QueryCondition::Eq(f, _) => format!("{} = ${}", f, n.to_string()),
+        QueryCondition::Neq(f, _) => format!("{} != ${}", f, n.to_string()),
+        QueryCondition::Gt(f, _) => format!("{} > ${}", f, n.to_string()),
+        QueryCondition::Gte(f, _) => format!("{} >= ${}", f, n.to_string()),
+        QueryCondition::Lt(f, _) => format!("{} <= ${}", f, n.to_string()),
+        QueryCondition::Lte(f, _) => format!("{} <= ${}", f, n.to_string()),
+        QueryCondition::In(f, _) => format!("{} = Any(${})", f, n.to_string()),
+        QueryCondition::Nin(f, _) => format!("{} != Any(${})", f, n.to_string()),
+    }
+}
+
+fn generate_select<'a>(
+    table: &String,
+    query_conditions: &'a Vec<QueryCondition<'a>>,
+) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+    let base_query = format!("select * from {}", table);
+    if query_conditions.is_empty() {
+        (base_query, vec![])
+    } else {
+        let (where_part, _) = query_conditions
+            .into_iter()
+            .fold(("".to_string(), 1), |acc, x| {
+                let (q, i) = acc;
+                (format!("{} and {}", q, query_cond_to_string(x, i)), i + 1)
+            });
+        let query_with_where = format!("{} where 1 = 1 {}", base_query, where_part);
+        let params = query_conditions
+            .into_iter()
+            .map(|x| match x {
+                QueryCondition::Eq(_, p) => *p,
+                QueryCondition::Neq(_, p) => *p,
+                QueryCondition::Gt(_, p) => *p,
+                QueryCondition::Gte(_, p) => *p,
+                QueryCondition::Lt(_, p) => *p,
+                QueryCondition::Lte(_, p) => *p,
+                QueryCondition::In(_, p) => *p,
+                QueryCondition::Nin(_, p) => *p,
+            })
+            .collect();
+        (query_with_where, params)
+    }
+}
+
+async fn select_all<'a, A>(
+    client: &Client,
+    table: &String,
+    query_conditions: &Vec<QueryCondition<'a>>,
+    map_row: &(dyn Fn(&Row) -> A),
+) -> Result<Vec<A>, Box<dyn Error>> {
+    let (query, params) = generate_select(table, query_conditions);
+    println!("{}", &query);
+    let stmt = client.prepare(&query).await?;
+    let row = client.query(&stmt, params.as_slice()).await?;
+    Ok(row.iter().map(map_row).collect())
+}
+
+async fn select<'a, A>(
+    client: &Client,
+    table: &String,
+    query_conditions: &'a Vec<QueryCondition<'a>>,
+    map_row: &(dyn Fn(&Row) -> A),
+) -> Result<Option<A>, Box<dyn Error>> {
+    let (query, params) = generate_select(table, query_conditions);
+    let stmt = client.prepare(&query).await?;
+    let row = client.query_opt(&stmt, params.as_slice()).await?;
+    Ok(row.map(move |x| map_row(&x)))
+}
+
+macro_rules! enum_str {
+    (enum $name:ident {
+        $($variant:ident = $val:expr),*,
+    }) => {
+        enum $name {
+            $($variant = $val),*
+        }
+
+        impl $name {
+            fn name(&self) -> &'static str {
+                match self {
+                    $($name::$variant => stringify!($variant)),*
+                }
+            }
+        }
+    };
+}
+
+macro_rules! entity {
+    (pub struct $name:ident {
+        $(pub $fname:ident : $field_type:ty,)*
+    }) => {
+        #[derive(Debug)]
+        struct $name {
+            $($fname : $field_type),*
+        }
+
+        paste! {
+            #[derive(Debug)]
+            enum [<$name Fields>] {
+                $([<$fname:camel>]),*
+            }
+
+            impl fmt::Display for [<$name Fields>] {
+                fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    fmt::Debug::fmt(self, f)
+                }
+            }
+        }
+
+        paste! {
+            enum [<$name Criteria>] {
+                $([<$fname:camel Eq>]($field_type)),*,
+                $([<$fname:camel Neq >]($field_type)),*,
+                $([<$fname:camel Gt>]($field_type)),*,
+                $([<$fname:camel Gte>]($field_type)),*,
+                $([<$fname:camel Lt>]($field_type)),*,
+                $([<$fname:camel Lte>]($field_type)),*,
+                $([<$fname:camel In>](Vec<$field_type>)),*,
+                $([<$fname:camel Nin>](Vec<$field_type>)),*,
+            }
+
+            impl [<$name Criteria>] {
+                fn to_query_condition<'a>(&'a self) -> QueryCondition<'a> {
+                    match self {
+                        $([<$name Criteria>]::[<$fname:camel Eq>](x) => QueryCondition::Eq(stringify!($fname).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$fname:camel Neq>](x) => QueryCondition::Neq(stringify!($fname).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$fname:camel Gt>](x) => QueryCondition::Gt(stringify!($fname).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$fname:camel Gte>](x) => QueryCondition::Gte(stringify!($fname).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$fname:camel Lt>](x) => QueryCondition::Lt(stringify!($fname).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$fname:camel Lte>](x) => QueryCondition::Lte(stringify!($fname).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$fname:camel In>](x) => QueryCondition::In(stringify!($fname).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$fname:camel Nin>](x) => QueryCondition::Nin(stringify!($fname).to_string(), x)),*,
+                    }
+                }
+            }
+
+            #[derive(Default,Debug)]
+            struct [<$name CriteriaStruct>] {
+                $([<$fname _eq>]: Option<$field_type>),*,
+                $([<$fname _neq >]: Option<$field_type>),*,
+                $([<$fname _gt>]: Option<$field_type>),*,
+                $([<$fname _gte>]: Option<$field_type>),*,
+                $([<$fname _lt>]: Option<$field_type>),*,
+                $([<$fname _lte>]: Option<$field_type>),*,
+                $([<$fname _in>]: Vec<$field_type>),*,
+                $([<$fname _nin>]: Vec<$field_type>),*,
+                search_term: Option<String>,
+            }
+
+            impl [<$name CriteriaStruct>] {
+                fn to_criteria(self) -> Vec<[<$name Criteria>]> {
+                    let mut c = vec![];
+                    $(if let Some(x) = self.[<$fname _eq>] {
+                        c.push([<$name Criteria>]::[<$fname:camel Eq>](x));
+                    })*
+                    c
+                }
+            }
+        }
+
+
+        impl $name {
+
+            fn field_names() -> &'static [&'static str] {
+                static NAMES: &'static [&'static str] = &[$(stringify!($fname)),*];
+                NAMES
+            }
+
+            fn field_types() -> &'static [&'static str] {
+                static TYPES: &'static [&'static str] = &[$(stringify!($field_type)),*];
+                TYPES
+            }
+
+            fn from_row(row: &Row) -> $name {
+                $(let $fname: $field_type = row.get(stringify!($fname));)*
+                $name {
+                    $($fname),*
+                }
+           }
+
+            fn to_params_x<'a>(&'a self) -> Vec<&'a (dyn ToSql + Sync)> {
+                vec![
+                    $(&self.$fname as &(dyn ToSql + Sync)),*
+                ][1..].into_iter().map(|x| *x as &(dyn ToSql + Sync)).collect::<Vec<&'a (dyn ToSql + Sync)>>()
+            }
+        }
+    }
+}
+
+/*
+entity! {
+pub struct Thing {
+    pub id: ThingId,
+    pub thing_name: String,
+    pub amount: f32,
+}
+}
+*/
+
+#[derive(Debug, Clone, Copy)]
+pub struct UserId(Uuid);
+
+impl ToSql for UserId {
+    fn to_sql(
+        &self,
+        ty: &tokio_postgres::types::Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn Error + Sync + Send>>
+    where
+        Self: Sized,
+    {
+        let UserId(id) = self;
+        id.to_sql(ty, out)
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool
+    where
+        Self: Sized,
+    {
+        <Uuid as ToSql>::accepts(ty)
+    }
+
+    fn to_sql_checked(
+        &self,
+        ty: &tokio_postgres::types::Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn Error + Sync + Send>> {
+        let UserId(id) = self;
+        id.to_sql_checked(ty, out)
+    }
+}
+
+impl<'a> FromSql<'a> for UserId {
+    fn from_sql(
+        ty: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        let uuid = Uuid::from_sql(ty, raw)?;
+        Ok(UserId(uuid))
+    }
+
+    fn from_sql_null(
+        ty: &tokio_postgres::types::Type,
+    ) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(tokio_postgres::types::WasNull))
+    }
+
+    fn from_sql_nullable(
+        ty: &tokio_postgres::types::Type,
+        raw: Option<&'a [u8]>,
+    ) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        match raw {
+            Some(raw) => Self::from_sql(ty, raw),
+            None => Self::from_sql_null(ty),
+        }
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        <Uuid as FromSql>::accepts(ty)
+    }
+}
+
+entity! {
+    pub struct User {
+        pub id: UserId,
+        pub name: String,
+        pub money: Decimal,
+        pub velocity: Decimal,
+        pub start_time: DateTime<Local>,
+        pub misc: String,
+    }
+}
+
+#[derive(FieldNames)]
+pub struct Item {
+    pub id: String,
+    pub name: String,
+}
+
 trait MyT {}
 
 fn mk_params<'a>(user: &'a User) -> [&'a (dyn ToSql + Sync); 5] {
@@ -222,129 +397,13 @@ fn from_row(row: &Row) -> User {
     let start_time: DateTime<Local> = row.get(4);
     let misc: String = row.get(5);
     User {
-        id,
+        id: UserId(id),
         name,
         money,
         velocity,
         start_time,
         misc,
     }
-}
-
-const BLAH: &'static str = "hello";
-
-macro_rules! sql_ent {
-    (type $name:ident = $other:ident;) => {
-        type $name = $other;
-
-        impl $name {
-            fn to_params() -> &'static [&'static (dyn ToSql + Sync)] {
-                &[]
-            }
-        }
-    };
-}
-
-sql_ent! {
-    type URow = User;
-}
-
-impl URow {
-    fn params(&self) -> &[&'static str] {
-        URow::field_names()
-    }
-}
-
-type Field = String;
-type Value = (dyn ToSql + Sync);
-
-enum QueryCondition<'a> {
-    Eq(&'a Field, &'a Value),
-    NEq(&'a Field, &'a Value),
-    Gt(&'a Field, &'a Value),
-    Gte(&'a Field, &'a Value),
-    Lt(&'a Field, &'a Value),
-    Lte(&'a Field, &'a Value),
-    In(&'a Field, &'a Value),
-    Nin(&'a Field, &'a Value),
-}
-
-fn queryCondToQueryStr(qCond: &QueryCondition, n: i32) -> String {
-    match qCond {
-        QueryCondition::Eq(f, _) => format!("{} = ${}", f, n.to_string()),
-        QueryCondition::NEq(f, _) => format!("{} != ${}", f, n.to_string()),
-        QueryCondition::Gt(f, _) => format!("{} > ${}", f, n.to_string()),
-        QueryCondition::Gte(f, _) => format!("{} >= ${}", f, n.to_string()),
-        QueryCondition::Lt(f, _) => format!("{} <= ${}", f, n.to_string()),
-        QueryCondition::Lte(f, _) => format!("{} <= ${}", f, n.to_string()),
-        QueryCondition::In(f, _) => format!("{} in ${}", f, n.to_string()),
-        QueryCondition::Nin(f, _) => format!("{} not in ${}", f, n.to_string()),
-    }
-}
-
-fn generate_select<'a>(
-    table: &String,
-    query_conditions: &'a Vec<QueryCondition<'a>>,
-) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
-    let base_query = format!("select * from {}", table);
-    if query_conditions.is_empty() {
-        (base_query, vec![])
-    } else {
-        let (where_part, _) = query_conditions
-            .into_iter()
-            .fold(("".to_string(), 1), |acc, x| {
-                let (q, i) = acc;
-                (format!("{} and {}", q, queryCondToQueryStr(&x, i)), i + 1)
-            });
-        let query_with_where = format!("{} where 1 = 1 {}", base_query, where_part);
-        let params = query_conditions
-            .into_iter()
-            .map(|x| match x {
-                QueryCondition::Eq(_, p) => *p,
-                QueryCondition::NEq(_, p) => *p,
-                QueryCondition::Gt(_, p) => *p,
-                QueryCondition::Gte(_, p) => *p,
-                QueryCondition::Lt(_, p) => *p,
-                QueryCondition::Lte(_, p) => *p,
-                QueryCondition::In(_, p) => *p,
-                QueryCondition::Nin(_, p) => *p,
-            })
-            .collect();
-        (query_with_where, params)
-    }
-}
-
-/*
-fn blah(ps: Vec<&(dyn ToSql + Sync)>) -> &[&(dyn ToSql + Sync)] {
-    ps.into_iter()
-        .map(|x| x)
-        .collect::<Vec<&(dyn ToSql + Sync)>>()
-        .as_slice()
-}
-*/
-
-async fn select_all<'a, A>(
-    client: &Client,
-    table: &String,
-    query_conditions: &'a Vec<QueryCondition<'a>>,
-    map_row: &(dyn Fn(&Row) -> A),
-) -> Result<Vec<A>, Box<dyn Error>> {
-    let (query, params) = generate_select(table, query_conditions);
-    let stmt = client.prepare(&query).await?;
-    let row = client.query(&stmt, params.as_slice()).await?;
-    Ok(row.iter().map(map_row).collect())
-}
-
-async fn select<'a, A>(
-    client: &Client,
-    table: &String,
-    query_conditions: &'a Vec<QueryCondition<'a>>,
-    map_row: &(dyn Fn(&Row) -> A),
-) -> Result<Option<A>, Box<dyn Error>> {
-    let (query, params) = generate_select(table, query_conditions);
-    let stmt = client.prepare(&query).await?;
-    let row = client.query_opt(&stmt, params.as_slice()).await?;
-    Ok(row.map(move |x| map_row(&x)))
 }
 
 #[tokio::main]
@@ -370,7 +429,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("{:?}", User::field_types());
 
     let user = User {
-        id: Uuid::new_v4(),
+        id: UserId(Uuid::new_v4()),
         name: rand_string,
         money: dec!(20000.00),
         velocity: dec!(23.23),
@@ -440,40 +499,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &"id".to_string(),
         fields.as_slice(),
         &user.id,
-        // params,
         user.to_params_x().as_slice(),
     )
     .await?;
 
+    /*
     let new_user = User {
         name: "new_email@eml.com".to_string(),
         ..user
     };
 
-    let new_params = mk_params(&new_user);
-
-    /*
     update(
         &client,
         &"demo_sc.users".to_string(),
         &"id".to_string(),
         fields.as_slice(),
         &my_id,
-        &new_params,
+        &new_user.to_params_x(),
     )
     .await?;
     */
-
-    let all = select_all(
-        &client,
-        &"demo_sc.users".to_string(),
-        &vec![QueryCondition::Eq(
-            &"name".to_string(),
-            &"sdkfjls@skdfjls.com".to_string(),
-        )],
-        &from_row,
-    )
-    .await?;
 
     let user_table = &"demo_sc.users".to_string();
 
@@ -481,25 +526,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &client,
         &"demo_sc.users".to_string(),
         &vec![QueryCondition::Eq(
-            &UserFields::Name.to_string(),
+            UserFields::Name.to_string(),
             &"sdkfjls@skdfjls.com".to_string(),
         )],
-        &from_row,
+        &User::from_row,
     )
     .await?;
 
-    let userCritStruct = UserCriteriaStruct::default();
+    let user_crit_struct = UserCriteriaStruct::default();
 
-    println!("user crite struct: {:?}", userCritStruct);
+    println!("user crit struct: {:?}", user_crit_struct);
 
     let all = select_all(
         &client,
         user_table,
-        &vec![QueryCondition::Eq(
-            &UserFields::Money.to_string(),
-            &dec!(20000.0000),
-        )],
-        &from_row,
+        &vec![
+            UserCriteria::NameIn(vec![
+                "bMFObtQQcYAO7CbEvdk8oE62aKZHdW".to_string(),
+                "Mg2XJ48FswHl6KENAVsxZXgcUhYDqR".to_string(),
+            ])
+            .to_query_condition(),
+            UserCriteria::MoneyEq(dec!(20000.00)).to_query_condition(),
+        ],
+        &User::from_row,
     )
     .await?;
 
