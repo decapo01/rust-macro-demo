@@ -5,11 +5,14 @@ extern crate core;
 use paste::paste;
 extern crate proc_macro;
 
+use validator::{Validate, ValidationError};
+
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Local, Utc};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use std::str::FromStr;
 
 use field_names::FieldNames;
@@ -95,6 +98,8 @@ enum QueryCondition<'a> {
     Lte(Field, &'a Value),
     In(Field, &'a Value),
     Nin(Field, &'a Value),
+    Like(Field, &'a Value),
+    NLike(Field, &'a Value),
 }
 
 fn query_cond_to_string(q_cond: &QueryCondition, n: i32) -> String {
@@ -107,6 +112,8 @@ fn query_cond_to_string(q_cond: &QueryCondition, n: i32) -> String {
         QueryCondition::Lte(f, _) => format!("{} <= ${}", f, n.to_string()),
         QueryCondition::In(f, _) => format!("{} = Any(${})", f, n.to_string()),
         QueryCondition::Nin(f, _) => format!("{} != Any(${})", f, n.to_string()),
+        QueryCondition::Like(f, _) => format!("{} like ${}", f, n.to_string()),
+        QueryCondition::NLike(f, _) => format!("{} not like ${}", f, n.to_string()),
     }
 }
 
@@ -136,6 +143,8 @@ fn generate_select<'a>(
                 QueryCondition::Lte(_, p) => *p,
                 QueryCondition::In(_, p) => *p,
                 QueryCondition::Nin(_, p) => *p,
+                QueryCondition::Like(_, p) => *p,
+                QueryCondition::NLike(_, p) => *p,
             })
             .collect();
         (query_with_where, params)
@@ -186,18 +195,26 @@ macro_rules! enum_str {
 }
 
 macro_rules! entity {
-    (pub struct $name:ident {
-        $(pub $fname:ident : $field_type:ty,)*
+    (
+        $(#[$struct_meta:meta])*
+        pub struct $name:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $field_vis:vis $field_name:ident : $field_type:ty
+            ),*$(,)+
     }) => {
-        #[derive(Debug)]
-        struct $name {
-            $($fname : $field_type),*
+        $(#[$struct_meta])*
+        pub struct $name {
+            $(
+                $(#[$field_meta])*
+                pub $field_name : $field_type,
+            )*
         }
 
         paste! {
             #[derive(Debug)]
             enum [<$name Fields>] {
-                $([<$fname:camel>]),*
+                $([<$field_name:camel>]),*
             }
 
             impl fmt::Display for [<$name Fields>] {
@@ -208,50 +225,77 @@ macro_rules! entity {
         }
 
         paste! {
+            #[derive(Debug)]
             enum [<$name Criteria>] {
-                $([<$fname:camel Eq>]($field_type)),*,
-                $([<$fname:camel Neq >]($field_type)),*,
-                $([<$fname:camel Gt>]($field_type)),*,
-                $([<$fname:camel Gte>]($field_type)),*,
-                $([<$fname:camel Lt>]($field_type)),*,
-                $([<$fname:camel Lte>]($field_type)),*,
-                $([<$fname:camel In>](Vec<$field_type>)),*,
-                $([<$fname:camel Nin>](Vec<$field_type>)),*,
+                $([<$field_name:camel Eq>]($field_type)),*,
+                $([<$field_name:camel Neq >]($field_type)),*,
+                $([<$field_name:camel Gt>]($field_type)),*,
+                $([<$field_name:camel Gte>]($field_type)),*,
+                $([<$field_name:camel Lt>]($field_type)),*,
+                $([<$field_name:camel Lte>]($field_type)),*,
+                $([<$field_name:camel In>](Vec<$field_type>)),*,
+                $([<$field_name:camel Nin>](Vec<$field_type>)),*,
+                $([<$field_name:camel Like>]($field_type)),*,
+                $([<$field_name:camel NLike>]($field_type)),*,
+            }
+
+            #[derive(Default,Debug)]
+            struct [<$name CriteriaStruct>] {
+                $([<$field_name _eq>]: Option<$field_type>),*,
+                $([<$field_name _neq >]: Option<$field_type>),*,
+                $([<$field_name _gt>]: Option<$field_type>),*,
+                $([<$field_name _gte>]: Option<$field_type>),*,
+                $([<$field_name _lt>]: Option<$field_type>),*,
+                $([<$field_name _lte>]: Option<$field_type>),*,
+                $([<$field_name _in>]: Vec<$field_type>),*,
+                $([<$field_name _nin>]: Vec<$field_type>),*,
+                $([<$field_name _like>]: Option<$field_type>),*,
+                $([<$field_name _nlike>]: Option<$field_type>),*,
             }
 
             impl [<$name Criteria>] {
                 fn to_query_condition<'a>(&'a self) -> QueryCondition<'a> {
                     match self {
-                        $([<$name Criteria>]::[<$fname:camel Eq>](x) => QueryCondition::Eq(stringify!($fname).to_string(), x)),*,
-                        $([<$name Criteria>]::[<$fname:camel Neq>](x) => QueryCondition::Neq(stringify!($fname).to_string(), x)),*,
-                        $([<$name Criteria>]::[<$fname:camel Gt>](x) => QueryCondition::Gt(stringify!($fname).to_string(), x)),*,
-                        $([<$name Criteria>]::[<$fname:camel Gte>](x) => QueryCondition::Gte(stringify!($fname).to_string(), x)),*,
-                        $([<$name Criteria>]::[<$fname:camel Lt>](x) => QueryCondition::Lt(stringify!($fname).to_string(), x)),*,
-                        $([<$name Criteria>]::[<$fname:camel Lte>](x) => QueryCondition::Lte(stringify!($fname).to_string(), x)),*,
-                        $([<$name Criteria>]::[<$fname:camel In>](x) => QueryCondition::In(stringify!($fname).to_string(), x)),*,
-                        $([<$name Criteria>]::[<$fname:camel Nin>](x) => QueryCondition::Nin(stringify!($fname).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel Eq>](x) => QueryCondition::Eq(stringify!($field_name).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel Neq>](x) => QueryCondition::Neq(stringify!($field_name).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel Gt>](x) => QueryCondition::Gt(stringify!($field_name).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel Gte>](x) => QueryCondition::Gte(stringify!($field_name).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel Lt>](x) => QueryCondition::Lt(stringify!($field_name).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel Lte>](x) => QueryCondition::Lte(stringify!($field_name).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel In>](x) => QueryCondition::In(stringify!($field_name).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel Nin>](x) => QueryCondition::Nin(stringify!($field_name).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel Like>](x) => QueryCondition::Like(stringify!($field_name).to_string(), x)),*,
+                        $([<$name Criteria>]::[<$field_name:camel NLike>](x) => QueryCondition::NLike(stringify!($field_name).to_string(), x)),*,
                     }
                 }
-            }
-
-            #[derive(Default,Debug)]
-            struct [<$name CriteriaStruct>] {
-                $([<$fname _eq>]: Option<$field_type>),*,
-                $([<$fname _neq >]: Option<$field_type>),*,
-                $([<$fname _gt>]: Option<$field_type>),*,
-                $([<$fname _gte>]: Option<$field_type>),*,
-                $([<$fname _lt>]: Option<$field_type>),*,
-                $([<$fname _lte>]: Option<$field_type>),*,
-                $([<$fname _in>]: Vec<$field_type>),*,
-                $([<$fname _nin>]: Vec<$field_type>),*,
-                search_term: Option<String>,
             }
 
             impl [<$name CriteriaStruct>] {
                 fn to_criteria(self) -> Vec<[<$name Criteria>]> {
                     let mut c = vec![];
-                    $(if let Some(x) = self.[<$fname _eq>] {
-                        c.push([<$name Criteria>]::[<$fname:camel Eq>](x));
+                    $(if let Some(x) = self.[<$field_name _eq>] {
+                        c.push([<$name Criteria>]::[<$field_name:camel Eq>](x));
+                    })*
+                    $(if let Some(x) = self.[<$field_name _neq>] {
+                        c.push([<$name Criteria>]::[<$field_name:camel Neq>](x));
+                    })*
+                    $(if let Some(x) = self.[<$field_name _gt>] {
+                        c.push([<$name Criteria>]::[<$field_name:camel Gt>](x));
+                    })*
+                    $(if let Some(x) = self.[<$field_name _gte>] {
+                        c.push([<$name Criteria>]::[<$field_name:camel Gte>](x));
+                    })*
+                    $(if let Some(x) = self.[<$field_name _lt>] {
+                        c.push([<$name Criteria>]::[<$field_name:camel Lt>](x));
+                    })*
+                    $(if let Some(x) = self.[<$field_name _lte>] {
+                        c.push([<$name Criteria>]::[<$field_name:camel Lte>](x));
+                    })*
+                    $(if !self.[<$field_name _in>].is_empty() {
+                        c.push([<$name Criteria>]::[<$field_name:camel In>](self.[<$field_name _in>]));
+                    })*
+                    $(if !self.[<$field_name _nin>].is_empty() {
+                        c.push([<$name Criteria>]::[<$field_name:camel Nin>](self.[<$field_name _nin>]));
                     })*
                     c
                 }
@@ -262,7 +306,7 @@ macro_rules! entity {
         impl $name {
 
             fn field_names() -> &'static [&'static str] {
-                static NAMES: &'static [&'static str] = &[$(stringify!($fname)),*];
+                static NAMES: &'static [&'static str] = &[$(stringify!($field_name)),*];
                 NAMES
             }
 
@@ -272,15 +316,15 @@ macro_rules! entity {
             }
 
             fn from_row(row: &Row) -> $name {
-                $(let $fname: $field_type = row.get(stringify!($fname));)*
+                $(let $field_name: $field_type = row.get(stringify!($field_name));)*
                 $name {
-                    $($fname),*
+                    $($field_name),*
                 }
            }
 
             fn to_params_x<'a>(&'a self) -> Vec<&'a (dyn ToSql + Sync)> {
                 vec![
-                    $(&self.$fname as &(dyn ToSql + Sync)),*
+                    $(&self.$field_name as &(dyn ToSql + Sync)),*
                 ][1..].into_iter().map(|x| *x as &(dyn ToSql + Sync)).collect::<Vec<&'a (dyn ToSql + Sync)>>()
             }
         }
@@ -297,8 +341,10 @@ pub struct Thing {
 }
 */
 
-#[derive(Debug, Clone, Copy)]
-pub struct UserId(Uuid);
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct UserId {
+    id: Uuid,
+}
 
 impl ToSql for UserId {
     fn to_sql(
@@ -309,7 +355,7 @@ impl ToSql for UserId {
     where
         Self: Sized,
     {
-        let UserId(id) = self;
+        let UserId { id } = self;
         id.to_sql(ty, out)
     }
 
@@ -325,7 +371,7 @@ impl ToSql for UserId {
         ty: &tokio_postgres::types::Type,
         out: &mut tokio_postgres::types::private::BytesMut,
     ) -> Result<tokio_postgres::types::IsNull, Box<dyn Error + Sync + Send>> {
-        let UserId(id) = self;
+        let UserId { id } = self;
         id.to_sql_checked(ty, out)
     }
 }
@@ -336,7 +382,7 @@ impl<'a> FromSql<'a> for UserId {
         raw: &'a [u8],
     ) -> Result<Self, Box<dyn Error + Sync + Send>> {
         let uuid = Uuid::from_sql(ty, raw)?;
-        Ok(UserId(uuid))
+        Ok(UserId { id: uuid })
     }
 
     fn from_sql_null(
@@ -361,14 +407,26 @@ impl<'a> FromSql<'a> for UserId {
 }
 
 entity! {
+    #[derive(Debug, Deserialize)]
     pub struct User {
-        pub id: UserId,
+        pub id : UserId,
         pub name: String,
         pub money: Decimal,
         pub velocity: Decimal,
         pub start_time: DateTime<Local>,
         pub misc: String,
     }
+}
+
+#[derive(Debug, Validate, Deserialize)]
+pub struct UserDto {
+    pub id: Uuid,
+    #[validate(email)]
+    pub name: String,
+    pub money: Decimal,
+    pub velocity: Decimal,
+    pub start_time: DateTime<Local>,
+    pub misc: String,
 }
 
 #[derive(FieldNames)]
@@ -397,7 +455,7 @@ fn from_row(row: &Row) -> User {
     let start_time: DateTime<Local> = row.get(4);
     let misc: String = row.get(5);
     User {
-        id: UserId(id),
+        id: UserId { id: id },
         name,
         money,
         velocity,
@@ -429,7 +487,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("{:?}", User::field_types());
 
     let user = User {
-        id: UserId(Uuid::new_v4()),
+        id: UserId { id: Uuid::new_v4() },
         name: rand_string,
         money: dec!(20000.00),
         velocity: dec!(23.23),
@@ -535,7 +593,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let user_crit_struct = UserCriteriaStruct::default();
 
-    println!("user crit struct: {:?}", user_crit_struct);
+    let new_crit_struct = UserCriteriaStruct {
+        name_eq: Some("sskjdfldsj".to_string()),
+        money_eq: Some(dec!(393.0)),
+        ..user_crit_struct
+    };
+
+    let crit_02 = new_crit_struct.to_criteria();
+
+    // let crit_vec = new_crit_struct.to_criteria();
+
+    // println!("crit vec: {:?}", crit_vec);
 
     let all = select_all(
         &client,
@@ -547,6 +615,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ])
             .to_query_condition(),
             UserCriteria::MoneyEq(dec!(20000.00)).to_query_condition(),
+            // UserCriteria::MiscEq("slfjsdklj".to_string()),
+            UserCriteria::VelocityEq(dec!(232.423)).to_query_condition(),
         ],
         &User::from_row,
     )
